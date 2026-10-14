@@ -43,13 +43,14 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from decimal import Decimal
 from difflib import SequenceMatcher
 from typing import Callable, Optional
 
 import requests
 from pydantic import BaseModel, Field
 
+from . import cache
+from .apify import run as apify_run
 from .config import config
 from .discover import DiscoveryError, bio_of, handle_of, related_of
 from .llm import _salvage, _strip_fences
@@ -61,6 +62,12 @@ MAPS_ACTOR = "compass/crawler-google-places"
 MAPS_RADIUS_KM = 4
 MAPS_PLACES = 30
 WEB_SEARCHES = 12
+# Competitor search is left as it was tested, except that candidates are checked
+# by Sonnet (config.check_model). An attempt to make it cheaper and faster —
+# fewer searches and a 90 s cap on Instagram's name search — cut a SaaS client's
+# list from a dozen direct competitors to one: the capped search stopped before
+# finding the handles. Do not trade its results for speed without re-testing on
+# a real client.
 SUGGESTIONS_USED = 15
 SITE_CHARS = 6000
 
@@ -113,35 +120,40 @@ class Discovery(BaseModel):
     understood: Understanding
     found: list[Found] = Field(default_factory=list)
     log: list[str] = Field(default_factory=list)       # one line per step, for the UI
+    # Collected along the way and reused by the audit, so it never pays twice:
+    profiles: dict[str, dict] = Field(default_factory=dict)  # handle -> profile row
+    search_terms: list[str] = Field(default_factory=list)
+    ig_search: dict[str, list[str]] = Field(default_factory=dict)  # term -> handles
+    maps_places: list[dict] = Field(default_factory=list)    # nearby places, in order
+    client_place: Optional[dict] = None                      # the client's own listing
 
 
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
 
-def _run(token: str, actor: str, run_input: dict, cap_usd: float) -> list[dict]:
-    """Run an actor under a spending cap and return its rows."""
-    from apify_client import ApifyClient
-
-    client = ApifyClient(token)
-    run = client.actor(actor).call(run_input=run_input, logger=None,
-                                   max_total_charge_usd=Decimal(str(cap_usd)))
-    if run is None:
-        return []
-    d = run if isinstance(run, dict) else run.model_dump(by_alias=True)
-    if not d.get("defaultDatasetId"):
-        return []
-    listed = client.dataset(d["defaultDatasetId"]).list_items()
-    rows = listed.items if hasattr(listed, "items") else listed.get("items", [])
-    return [r for r in rows if isinstance(r, dict)]
+_run = apify_run    # kept under the old name; visibility and facebook import it
 
 
 def _profiles(token: str, handles: list[str]) -> dict[str, dict]:
-    if not handles:
-        return {}
-    rows = _run(token, PROFILE_ACTOR, {"usernames": handles, "resultsLimit": 1},
-                cap_usd=round(len(handles) * 0.003 + 0.05, 2))
-    return {handle_of(r): r for r in rows if handle_of(r) and not r.get("error")}
+    """Full profile rows, latest 12 posts included. Today's are reused."""
+    out: dict[str, dict] = {}
+    missing = []
+    for h in dict.fromkeys(_clean(h) for h in handles if h):
+        got = cache.get_profile(h)
+        if got:
+            out[h] = got
+        else:
+            missing.append(h)
+    if missing:
+        rows = _run(token, PROFILE_ACTOR, {"usernames": missing, "resultsLimit": 1},
+                    cap_usd=round(len(missing) * 0.003 + 0.05, 2))
+        for r in rows:
+            h = handle_of(r)
+            if h and not r.get("error"):
+                out[h] = r
+                cache.put_profile(h, r)
+    return out
 
 
 def _norm(s: str) -> str:
@@ -464,8 +476,13 @@ def _handles_from_search(token: str, named: list[dict], u: Understanding) -> dic
 # --------------------------------------------------------------------------- #
 
 def _maps(token: str, client_name: str, u: Understanding,
-          log: Callable[[str], None]) -> tuple[Optional[dict], dict[str, dict]]:
-    """(the client's own listing or None, handle -> nearby place)."""
+          log: Callable[[str], None]
+          ) -> tuple[Optional[dict], dict[str, dict], list[dict]]:
+    """(the client's own listing or None, handle -> nearby place, every place).
+
+    Every place is returned too: the audit's "can people find you on Maps"
+    section reuses them instead of searching Maps a second time.
+    """
     me = None
     if client_name and u.market:
         rows = _run(token, MAPS_ACTOR,
@@ -491,22 +508,31 @@ def _maps(token: str, client_name: str, u: Understanding,
         log(f"Maps: client not found on Maps, searching '{term}' across {u.market}")
     else:
         log("Maps: skipped — no city to search in")
-        return None, {}
+        return None, {}, []
     rows = _run(token, MAPS_ACTOR, run_input, cap_usd=0.5)
 
-    out: dict[str, dict] = {}
-    for p in rows:
-        site = p.get("website") or ""
+    def handles(p: dict) -> list[str]:
+        """The contact add-on's links first, then the Maps website field,
+        then the website itself."""
         found = _handles_in(" ".join(p.get("instagrams") or []))
+        site = p.get("website") or ""
         if not found and "instagram.com" in site:
             found = _handles_in(site)
         if not found and site:
             found = _site_handles(site)
+        return found
+
+    # Every website at once: one slow site no longer holds up the rest.
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        found_all = list(pool.map(handles, rows))
+
+    out: dict[str, dict] = {}
+    for p, found in zip(rows, found_all):
         # The first link on a business's site is nearly always its own account;
         # later ones are brands it stocks or the web designer's credit.
         if found and found[0] not in out:
             out[found[0]] = p
-    return me, out
+    return me, out, rows
 
 
 # --------------------------------------------------------------------------- #
@@ -608,7 +634,7 @@ def _judge(client: dict, u: Understanding, cards: list[dict]) -> dict[str, dict]
 
     def one(batch: list[dict]) -> dict[str, dict]:
         resp = api.messages.create(
-            model=config.discovery_model, max_tokens=16000, system=system,
+            model=config.check_model, max_tokens=16000, system=system,
             output_config={"effort": "high",
                            "format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
             messages=[{"role": "user",
@@ -676,22 +702,36 @@ def find_competitors(
         f"confidence: {u.confidence}]")
     client = {"handle": seed, "name": client_name}
 
-    # Web search and Maps are independent and each takes a minute or more.
-    say("Searching the web" + (" and Google Maps..." if u.kind == "local" else "..."))
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    # Web search, Maps and the audit's Instagram search check are independent
+    # and each takes a minute or more, so they run side by side.
+    say("Searching the web" + (", Google Maps" if u.kind == "local" else "")
+        + " and Instagram...")
+
+    def ig_visibility() -> tuple[list[str], dict[str, list[str]]]:
+        from .visibility import suggest_terms, search_instagram
+        terms = suggest_terms(u.category or u.summary, u.market, u.kind == "local")
+        return terms, search_instagram(token, terms)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
         web_f = pool.submit(_web_named, seed, client_name, u)
         maps_f = pool.submit(_maps, token, client_name, u, say) if u.kind == "local" else None
+        vis_f = pool.submit(ig_visibility)
         try:
             named = web_f.result()
         except Exception as e:
             say(f"Web search failed, carrying on without it: {e}")
             named = []
-        my_place, nearby = None, {}
+        my_place, nearby, all_places = None, {}, []
         if maps_f is not None:
             try:
-                my_place, nearby = maps_f.result()
+                my_place, nearby, all_places = maps_f.result()
             except Exception as e:
                 say(f"Maps failed, carrying on without it: {e}")
+        terms, ig_search = [], {}
+        try:
+            terms, ig_search = vis_f.result()
+        except Exception as e:
+            say(f"Instagram search check failed, the audit will retry it: {e}")
     if my_place:
         client["address"] = my_place.get("address") or ""
     say(f"Web search named {len(named)} competitors"
@@ -790,7 +830,13 @@ def find_competitors(
     say(f"Done: {sum(f.label == 'direct' for f in on_ig)} direct competitors on "
         f"Instagram, {sum(f.label == 'no_instagram' for f in web_only)} more "
         "without a usable Instagram.")
-    return Discovery(understood=u, found=on_ig + web_only, log=log)
+    keep = ("title", "totalScore", "reviewsCount", "categoryName", "address",
+            "website", "rank", "searchString")
+    return Discovery(
+        understood=u, found=on_ig + web_only, log=log,
+        profiles={seed: me, **profiles}, search_terms=terms, ig_search=ig_search,
+        maps_places=[{k: p.get(k) for k in keep} for p in all_places],
+        client_place={k: my_place.get(k) for k in keep} if my_place else None)
 
 
 def is_stale(f: Found, days: int = 60) -> bool:

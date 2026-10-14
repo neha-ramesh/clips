@@ -15,3 +15,6 @@ temp/**/*.json
 temp/**/*.txt
 temp/costs.jsonl
 !.env.example
+
+# Downloaded post images (other accounts' content)
+thumbs/

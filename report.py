@@ -776,7 +776,8 @@ ones that fell short.</p>
 """
 
 
-def section_ideas(ideas) -> str:
+def section_ideas(ideas, shown: int = 0) -> str:
+    """`shown` > 0: show that many proven ideas, fold the rest away."""
     if not ideas or not ideas.ideas:
         return """
 <div class="part"><span>Part three</span>
@@ -823,12 +824,32 @@ def section_ideas(ideas) -> str:
 
     out = [f'<div class="part"><span>Part three</span>'
            f'<h2 class="ph">What to make</h2></div>']
+    rest: list = []
+    if shown and len(proven) > shown:
+        proven, rest = proven[:shown], proven[shown:]
     if proven:
-        out.append('<p class="note">Strongest evidence first. Start with '
+        out.append('<h2>What to make</h2><p class="note">Strongest evidence '
+                   'first. Start with number one.</p>' if shown else
+                   '<p class="note">Strongest evidence first. Start with '
                    'number one.</p>')
         out.append('<div class="recs">'
                    + "".join(card(i, n) for n, i in enumerate(proven, 1))
                    + "</div>")
+    if rest:
+        out.append('<details class="more"><summary>'
+                   f'{len(rest)} more ideas backed by the data</summary><div>'
+                   '<div class="recs">'
+                   + "".join(card(i, n) for n, i in enumerate(rest, len(proven) + 1))
+                   + "</div></div></details>")
+        proven = proven + rest
+    if local and shown:
+        out.append('<details class="more"><summary>'
+                   f'{len(local)} local ideas, untested here</summary><div>'
+                   '<p class="note">From knowing the place, not the posts. '
+                   'Nobody in this set has tried them.</p><div class="recs">'
+                   + "".join(card(i, n) for n, i in enumerate(local, len(proven) + 1))
+                   + "</div></div></details>")
+        local = []
     if local:
         out.append('<h2>Worth trying, but untested here</h2>')
         out.append('<p class="note">From knowing the place, not the posts. '
@@ -843,7 +864,16 @@ def section_ideas(ideas) -> str:
 
 def build(accounts: list[Account], client: str, stamp: str,
           out_dir: Optional[Path] = None, ideas=None,
-          context: Optional[dict] = None) -> str:
+          context: Optional[dict] = None, extras=None, brief=None) -> str:
+    """The whole report as one self-contained HTML file, in tabs.
+
+    `extras` (pipeline/audit.py) and `brief` (pipeline/brief.py) are optional;
+    a tab with nothing in it is left out.
+    """
+    import report_parts as rp
+    import report_tabs as rt
+    from pipeline.habits import checklist
+
     ok = [a for a in accounts if not a.error]
     posts = sum(a.post_count for a in ok)
     pretty = client.replace("_", " ").replace("-", " ").title()
@@ -852,44 +882,99 @@ def build(accounts: list[Account], client: str, stamp: str,
         shown = f"{d.day} {d.strftime('%B %Y')}"
     except ValueError:
         shown = stamp
+    me = next((a for a in ok if a.handle.lower() == client.lower()), None)
 
-    # What the reader needs to know was fed in. The ideas below lean on the
-    # business, the city and the language, none of which come from the data —
-    # so saying what was supplied lets someone judge whether the ideas were
-    # working from the right picture, and spot a blank field as the reason an
-    # idea reads generic.
-    ctx = ""
-    if context and any(context.values()):
-        rows = "".join(
-            f"<div><dt>{esc(k)}</dt><dd>{esc(v)}</dd></div>"
-            for k, v in context.items() if v
-        )
-        ctx = f'<dl class="ctx">{rows}</dl>'
+    # --- You today -----------------------------------------------------------
+    today_so = ""
+    if me and extras:
+        h = extras.habits(accounts).get(me.handle.lower())
+        bad = [name.lower() for name, good, _ in checklist(h) if good is False] if h else []
+        if bad:
+            today_so = (f"{len(bad)} simple thing{'s' if len(bad) != 1 else ''} on "
+                        f"your profile {'are' if len(bad) != 1 else 'is'} costing "
+                        f"you reach: {', '.join(bad)}.")
+    today = (rt.sowhat(today_so) + rp.section_now(accounts, client, extras, out_dir)
+             + rt.fold("The business, as briefed", rp.section_brief(brief)))
+
+    # --- Can people find you -------------------------------------------------
+    find = rp.section_visibility(accounts, client, extras)
+    if find:
+        facts = [f for f, tab in rt.summary_facts(accounts, client, extras, ideas)
+                 if tab == "t-find"]
+        find = rt.sowhat(facts[0] if facts else "") + find.replace(
+            "Location tag</th>", f"Location tag{rt.tip('location tag')}</th>").replace(
+            "Highlights</th>", f"Highlights{rt.tip('highlights')}</th>")
+
+    # --- Competitors ---------------------------------------------------------
+    cards = rp.teardown_cards(accounts, client, extras, ideas, out_dir)
+    lead = next((t.takeaway for t in getattr(ideas, "teardowns", []) or []
+                 if t.takeaway), "")
+    comp = (rt.sowhat(esc(lead)) + "<h2>Side by side</h2>"
+            + rt.compare_table(accounts, client, extras)
+            + ("<h2>One at a time</h2><p class='note'>Pick a competitor: their "
+               "best posts, their weakest, and what to take from them.</p>"
+               + rt.picker(cards) if cards else "")
+            + rt.fold("Facebook, page by page", rp.section_facebook(accounts, client, extras))
+            + rt.fold("Who is running ads (experimental)", rp.section_ads(accounts, client, extras)))
+
+    # --- What works ----------------------------------------------------------
+    works_facts = [f for f, tab in rt.summary_facts(accounts, client, extras, ideas)
+                   if tab == "t-works"]
+    formats = rp.section_formats(accounts, client, extras)
+    works = (rt.sowhat(works_facts[0] if works_facts else
+                       (esc(ideas.patterns[0].what) if ideas and ideas.patterns else ""))
+             + formats.replace("judged by their cover.", f"judged by their cover{rt.tip('cover')}.")
+             + rt.fold("What each account posts, and what it earns", section_seen(accounts, client),
+                       open_=not formats)
+             + rt.fold("What the winning posts have in common", section_patterns(ideas))
+             + rt.fold("Each account's biggest day", section_big_days(accounts, client))
+             + rt.fold("What time to post", section_timing(accounts))
+             + rt.fold("How often they post", section_rhythm(accounts, client))
+             + (rt.fold("Follower growth", section_growth(out_dir, client)) if out_dir else ""))
+
+    # --- The plan ------------------------------------------------------------
+    plan_so = ""
+    proven = [i for i in getattr(ideas, "ideas", []) or [] if not i.local]
+    if proven:
+        plan_so = f"Start with &ldquo;{esc(proven[0].idea)}&rdquo; &mdash; it has the strongest proof behind it."
+    plan = (rt.sowhat(plan_so) + section_ideas(ideas, shown=5) + rp.section_plan(ideas)
+            + rt.fold("Hashtags the competition uses", section_hashtags(accounts, client)))
+
+    # --- Conra AI and notes --------------------------------------------------
+    conra = rp.section_offer(extras) + rp.section_notes(brief) + rp.section_log(extras)
+
+    tabs = [("t-summary", "Summary", rt.summary_pane(accounts, client, extras, ideas)),
+            ("t-today", "You today", today),
+            ("t-find", "Can people find you", find),
+            ("t-competitors", "Competitors", comp),
+            ("t-works", "What works", works),
+            ("t-plan", "The plan", plan),
+            ("t-conra", "Conra AI", conra)]
+    tabs = [t for t in tabs if t[2].strip()]
+    bar = "".join(f'<button data-tab="{tid}">{label}</button>' for tid, label, _ in tabs)
+    panes = "".join(f'<section class="pane" id="{tid}">{body}</section>'
+                    for tid, _, body in tabs)
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Competitors &mdash; {esc(pretty)}</title>
-<style>{CSS}</style></head><body>
+<title>Social media audit &mdash; {esc(pretty)}</title>
+<style>{CSS}{rp.CSS}{rt.CSS}</style></head><body>
 <header><div class="wrap">
-  <h1>What the competition is getting away with</h1>
-  <p class="sub">{esc(pretty)} &nbsp;&middot;&nbsp; {shown}
-     &nbsp;&middot;&nbsp; {len(ok)} accounts, {posts} posts</p>
+  <h1>Social media audit: {esc(pretty)}</h1>
+  <p class="sub">{shown} &nbsp;&middot;&nbsp; {len(ok)} accounts compared,
+     {posts} posts read</p>
 </div></header>
 <div class="wrap">
-{ctx}
-{section_seen(accounts, client)}
-{section_big_days(accounts, client)}
-{section_timing(accounts)}
-{section_rhythm(accounts, client)}
-{section_growth(out_dir, client) if out_dir else ""}
-{section_hashtags(accounts, client)}
-{section_patterns(ideas)}
-{section_ideas(ideas)}
-<footer>Public Instagram data, read {shown}. &ldquo;A normal post&rdquo; is the
-middle one &mdash; half did better, half did worse. Posts hiding their like
+<nav class="tabs">{bar}</nav>
+<p class="howto">Every number is a count of real likes and posts.
+Tap <span class="tip" tabindex="0" data-tip="Hover or tap the ⓘ next to a term for what it means.">ⓘ</span>
+for what a term means.</p>
+{panes}
+<footer>Public Instagram and Facebook data, read {shown}. &ldquo;A normal post&rdquo;
+is the middle one &mdash; half did better, half did worse. Posts hiding their like
 count are counted but left out of the like figures.</footer>
-</div></body></html>"""
+</div><script>{rt.JS}</script></body></html>"""
 
 
 def main() -> int:
@@ -948,9 +1033,12 @@ def main() -> int:
                         place=args.place, language=args.language,
                         notes=args.notes)
 
+    from pipeline.audit import load as load_extras
+    extras = load_extras(out_dir, args.client, stamp)
+
     path = out_dir / f"{args.client}_report_{stamp}.html"
     path.write_text(
-        build(accounts, args.client, stamp, out_dir, ideas, {
+        build(accounts, args.client, stamp, out_dir, ideas, extras=extras, context={
             "Business": args.business,
             "Customers in": args.place,
             "Audience language": args.language,

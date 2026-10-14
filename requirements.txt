@@ -7,3 +7,4 @@ apify-client>=1.8     # fetching posts and profiles
 requests>=2.31        # apify-client needs it; not a direct import
 
 streamlit>=1.64       # the app: `streamlit run app.py`
+pillow>=10.0            # shrinks post images for the report and the visual step

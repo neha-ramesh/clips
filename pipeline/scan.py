@@ -91,12 +91,37 @@ def get_posts(client, handle: str, limit: int) -> list[dict]:
 
 def get_followers(client, handles: list[str]) -> dict[str, int]:
     """Follower counts for a set of accounts. One run, one result each."""
-    out: dict[str, int] = {}
+    return {h: int(p.get("followersCount") or 0)
+            for h, p in get_profiles(client, handles).items()}
+
+
+# The profile fields the report reads. The rest of a profile row is picture
+# URLs and twelve embedded posts, which would only bloat every snapshot.
+PROFILE_FIELDS = ("fullName", "biography", "externalUrl", "businessCategoryName",
+                  "isBusinessAccount", "verified", "private", "highlightReelCount",
+                  "postsCount", "followsCount", "followersCount", "facebookPage")
+
+
+def slim_profile(row: dict) -> dict:
+    out = {k: row.get(k) for k in PROFILE_FIELDS if row.get(k) is not None}
+    links = []
+    for u in row.get("externalUrls") or []:
+        url = u.get("url") if isinstance(u, dict) else u
+        if url:
+            links.append(str(url))
+    if links:
+        out["externalUrls"] = links
+    return out
+
+
+def get_profiles(client, handles: list[str]) -> dict[str, dict]:
+    """Slimmed profiles for a set of accounts. One run, one result each."""
+    out: dict[str, dict] = {}
     for r in _rows(client, PROFILE_ACTOR,
                    {"usernames": handles, "resultsLimit": 1}):
         name = (r.get("username") or "").lower()
-        if name:
-            out[name] = int(r.get("followersCount") or 0)
+        if name and not r.get("error"):
+            out[name] = slim_profile(r)
     return out
 
 
@@ -478,6 +503,9 @@ class Account(BaseModel):
     fetched: int = 0
     posts: list[dict] = Field(default_factory=list)   # inside the window
     error: str = ""
+    # Bio, link, highlights, category: see `slim_profile`. Empty for snapshots
+    # taken before profiles were kept.
+    profile: dict = Field(default_factory=dict)
 
     typical_likes: float = 0.0
     typical_comments: float = 0.0
@@ -585,18 +613,22 @@ def scan(
     # Followers in a separate pass, after the posts. Mixing two actors into one
     # thread pool is what previously cost us data — three concurrent runs came
     # back with less than three sequential ones.
-    followers: dict[str, int] = {}
+    profiles: dict[str, dict] = {}
     try:
-        followers = get_followers(client, handles)
+        profiles = get_profiles(client, handles)
     except Exception as e:
         if verbose:
             print(f"    follower counts unavailable: {str(e)[:90]}")
 
-    out = [
-        Account(handle=h, days=days, error=err) if err
-        else measure(h, raw, days, followers.get(h.lower(), 0), limit)
-        for h, raw, err in fetched
-    ]
+    out = []
+    for h, raw, err in fetched:
+        if err:
+            out.append(Account(handle=h, days=days, error=err))
+            continue
+        prof = profiles.get(h.lower(), {})
+        a = measure(h, raw, days, int(prof.get("followersCount") or 0), limit)
+        a.profile = prof
+        out.append(a)
 
     if verbose:
         for a in out:
@@ -606,6 +638,115 @@ def scan(
                 flag = " (limit reached — there are more)" if a.truncated else ""
                 print(f"    {a.handle}: {a.followers:,} followers, "
                       f"{a.post_count} posts in {days} days{flag}")
+    return out
+
+
+def _needs_more(posts: list[dict], days: int) -> bool:
+    """True when the profile's latest posts do not reach back to the window's
+    start — the account posted more than the profile shows."""
+    times = [parse_time(p.get("timestamp", "")) for p in posts if not p.get("isPinned")]
+    times = [t for t in times if t]
+    return bool(times) and len(times) >= 10 and min(times) >= window_start(days)
+
+
+def scan_fast(
+    token: str,
+    handles: list[str],
+    *,
+    days: int = 30,
+    limit: int = 40,
+    profiles: Optional[dict[str, dict]] = None,
+    comment_posts: int = 3,
+    progress=print,
+) -> list[Account]:
+    """The scan, from profiles first. Same Account as `scan`, a fraction of
+    the cost and time.
+
+    A profile lookup ($0.0026) already carries the account's latest 12 posts
+    with likes, comments, captions, images, hashtags and locations. For most
+    accounts that covers the whole window, and competitor search has usually
+    fetched the profile already — so the post scraper ($0.0027 a post, ~30 s an
+    account) runs only for accounts that posted more than the profile shows,
+    and only back to the window's start.
+
+    Profiles carry no comment text and no reel length, so the `comment_posts`
+    best posts of each account are fetched once more for those.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .apify import run as apify_run
+    from .competitors import _profiles
+
+    handles = [h.strip().lstrip("@").lower() for h in handles if h.strip()]
+    have = {h: p for h, p in (profiles or {}).items() if h in handles}
+    missing = [h for h in handles if h not in have]
+    if missing:
+        progress(f"Looking up {len(missing)} profile(s)...")
+        have.update(_profiles(token, missing))
+
+    since = window_start(days).date().isoformat()
+    heavy = [h for h in handles if h in have
+             and _needs_more(have[h].get("latestPosts") or [], days)]
+
+    def more(h: str) -> tuple[str, list[dict], str]:
+        try:
+            rows = apify_run(token, POSTS_ACTOR,
+                             {"directUrls": [f"https://www.instagram.com/{h}/"],
+                              "resultsType": "posts", "resultsLimit": limit,
+                              "onlyPostsNewerThan": since},
+                             cap_usd=round(limit * 0.003 + 0.02, 2))
+            return h, [r for r in rows if r.get("timestamp")][:limit], ""
+        except Exception as e:
+            return h, [], str(e)[:200]
+
+    extra: dict[str, list[dict]] = {}
+    if heavy:
+        progress(f"{len(heavy)} account(s) posted more than their profile shows; "
+                 "fetching the rest of their month...")
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            for h, rows, err in pool.map(more, heavy):
+                if rows:
+                    extra[h] = rows
+
+    out: list[Account] = []
+    for h in handles:
+        prof = have.get(h)
+        if not prof:
+            out.append(Account(handle=h, days=days,
+                               error="No profile came back. Check the handle, "
+                                     "or the account may be private."))
+            continue
+        raw = extra.get(h) or [p for p in prof.get("latestPosts") or []
+                               if p.get("timestamp")]
+        a = measure(h, raw, days, int(prof.get("followersCount") or 0),
+                    limit if h in extra else 0)
+        a.profile = slim_profile(prof)
+        out.append(a)
+
+    # Comments and reel lengths for each account's best posts.
+    want: dict[str, dict] = {}
+    for a in out:
+        top = sorted([p for p in a.posts if int(p.get("likesCount") or 0) >= 0],
+                     key=lambda p: -int(p.get("likesCount") or 0))[:comment_posts]
+        for p in top:
+            if url_of(p) and not p.get("latestComments"):
+                want[url_of(p).rstrip("/")] = p
+    if want:
+        progress(f"Reading the comments on {len(want)} top posts...")
+        try:
+            rows = apify_run(token, POSTS_ACTOR,
+                             {"directUrls": list(want), "resultsType": "posts",
+                              "resultsLimit": 1},
+                             cap_usd=round(len(want) * 0.003 + 0.02, 2))
+            for r in rows:
+                p = want.get((r.get("url") or r.get("inputUrl") or "").rstrip("/"))
+                if p is None:
+                    continue
+                for k in ("latestComments", "videoDuration", "videoPlayCount"):
+                    if r.get(k) is not None:
+                        p[k] = r[k]
+        except Exception as e:
+            progress(f"Comments could not be fetched: {str(e)[:120]}")
     return out
 
 

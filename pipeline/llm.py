@@ -70,11 +70,12 @@ def _salvage(raw: str, required_field: str) -> list[dict[str, Any]]:
 
 def _call_claude(
     system: str,
-    user: str,
+    user: "str | list[dict[str, Any]]",
     model: str | None,
     temperature: float,
     max_tokens: int,
     schema: dict[str, Any] | None = None,
+    effort: str | None = None,
 ) -> str:
     from anthropic import Anthropic
 
@@ -90,15 +91,22 @@ def _call_claude(
         # Prefilling the assistant turn with "{" used to force JSON here, and
         # newer models reject it outright. So the instruction goes in the prompt
         # and _strip_fences handles any preamble that arrives anyway.
-        "messages": [{"role": "user", "content": user + JSON_ONLY_SUFFIX}],
+        # A list is content blocks — text and images — for the steps that look
+        # at the posts themselves.
+        "messages": [{"role": "user", "content": (
+            user + [{"type": "text", "text": JSON_ONLY_SUFFIX}]
+            if isinstance(user, list) else user + JSON_ONLY_SUFFIX)}],
     }
 
     # Structured outputs replaced prefill. Unlike prompting, this is validated
     # by the API, so malformed JSON stops being possible rather than unlikely.
+    output_config: dict[str, Any] = {}
     if schema is not None:
-        kwargs["output_config"] = {
-            "format": {"type": "json_schema", "schema": schema}
-        }
+        output_config["format"] = {"type": "json_schema", "schema": schema}
+    if effort:
+        output_config["effort"] = effort
+    if output_config:
+        kwargs["output_config"] = output_config
 
     # Newer models reject `temperature` outright, so send it only when asking
     # for something other than the default.
@@ -137,7 +145,7 @@ def _call_claude(
 
 def complete_json(
     system: str,
-    user: str,
+    user: "str | list[dict[str, Any]]",
     *,
     schema: dict[str, Any] | None = None,
     list_key: str = "items",
@@ -146,9 +154,11 @@ def complete_json(
     model: str | None = None,
     temperature: float = 0.3,
     max_tokens: int = 16000,
+    effort: str | None = None,
 ) -> dict[str, Any]:
-    """Send a prompt, get parsed JSON back."""
-    raw = _call_claude(system, user, model, temperature, max_tokens, schema)
+    """Send a prompt — text, or content blocks with images — get JSON back."""
+    raw = _call_claude(system, user, model, temperature, max_tokens, schema,
+                       effort)
     text = _strip_fences(raw)
 
     try:
