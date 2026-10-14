@@ -1,0 +1,17 @@
+# Secrets - API keys live here, never commit
+.env
+.env.*
+
+# Local environment and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Client data: scans, reports, scraped profiles
+data/
+
+# Experiment outputs: raw scraped data, transcripts, cost logs
+temp/**/*.json
+temp/**/*.txt
+temp/costs.jsonl
+!.env.example
